@@ -1,0 +1,232 @@
+"""Tests for the Parsefy client."""
+
+import os
+from io import BytesIO
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+from pydantic import BaseModel, Field
+
+from parsefy import Parsefy, APIError, ValidationError, ExtractResult
+
+
+class SampleSchema(BaseModel):
+    """Sample schema for testing."""
+
+    name: str = Field(description="A name field")
+    value: int = Field(description="A numeric value")
+
+
+class TestParsefyInit:
+    """Tests for Parsefy client initialization."""
+
+    def test_init_with_api_key(self) -> None:
+        """Test initialization with direct API key."""
+        client = Parsefy(api_key="test_key")
+        assert client.api_key == "test_key"
+        client.close()
+
+    def test_init_with_env_var(self) -> None:
+        """Test initialization with environment variable."""
+        with patch.dict(os.environ, {"PARSEFY_API_KEY": "env_key"}):
+            client = Parsefy()
+            assert client.api_key == "env_key"
+            client.close()
+
+    def test_init_without_api_key_raises(self) -> None:
+        """Test that initialization without API key raises ValidationError."""
+        with patch.dict(os.environ, {}, clear=True):
+            # Remove the env var if it exists
+            os.environ.pop("PARSEFY_API_KEY", None)
+            with pytest.raises(ValidationError) as exc_info:
+                Parsefy()
+            assert "API key is required" in str(exc_info.value)
+
+    def test_init_with_custom_timeout(self) -> None:
+        """Test initialization with custom timeout."""
+        client = Parsefy(api_key="test_key", timeout=120.0)
+        assert client.timeout == 120.0
+        client.close()
+
+
+class TestPrepareFile:
+    """Tests for file preparation logic."""
+
+    @pytest.fixture
+    def client(self) -> Parsefy:
+        """Create a test client."""
+        client = Parsefy(api_key="test_key")
+        yield client
+        client.close()
+
+    def test_prepare_file_from_path_string(self, client: Parsefy, tmp_path: Path) -> None:
+        """Test preparing file from path string."""
+        pdf_file = tmp_path / "test.pdf"
+        pdf_file.write_bytes(b"%PDF-1.4 test content")
+
+        filename, content, mime_type = client._prepare_file(str(pdf_file))
+
+        assert filename == "test.pdf"
+        assert content == b"%PDF-1.4 test content"
+        assert mime_type == "application/pdf"
+
+    def test_prepare_file_from_path_object(self, client: Parsefy, tmp_path: Path) -> None:
+        """Test preparing file from Path object."""
+        docx_file = tmp_path / "test.docx"
+        docx_file.write_bytes(b"docx content")
+
+        filename, content, mime_type = client._prepare_file(docx_file)
+
+        assert filename == "test.docx"
+        assert content == b"docx content"
+        assert (
+            mime_type
+            == "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+    def test_prepare_file_from_bytes(self, client: Parsefy) -> None:
+        """Test preparing file from bytes."""
+        filename, content, mime_type = client._prepare_file(b"raw bytes content")
+
+        assert filename == "document.pdf"
+        assert content == b"raw bytes content"
+        assert mime_type == "application/pdf"
+
+    def test_prepare_file_from_file_object(self, client: Parsefy) -> None:
+        """Test preparing file from file-like object."""
+        file_obj = BytesIO(b"file object content")
+        file_obj.name = "uploaded.pdf"
+
+        filename, content, mime_type = client._prepare_file(file_obj)
+
+        assert filename == "uploaded.pdf"
+        assert content == b"file object content"
+        assert mime_type == "application/pdf"
+
+    def test_prepare_file_not_found(self, client: Parsefy) -> None:
+        """Test that non-existent file raises ValidationError."""
+        with pytest.raises(ValidationError) as exc_info:
+            client._prepare_file("/nonexistent/path/file.pdf")
+        assert "File not found" in str(exc_info.value)
+
+    def test_prepare_file_unsupported_type(self, client: Parsefy, tmp_path: Path) -> None:
+        """Test that unsupported file type raises ValidationError."""
+        txt_file = tmp_path / "test.txt"
+        txt_file.write_bytes(b"text content")
+
+        with pytest.raises(ValidationError) as exc_info:
+            client._prepare_file(txt_file)
+        assert "Unsupported file type" in str(exc_info.value)
+
+    def test_prepare_file_empty(self, client: Parsefy, tmp_path: Path) -> None:
+        """Test that empty file raises ValidationError."""
+        empty_file = tmp_path / "empty.pdf"
+        empty_file.write_bytes(b"")
+
+        with pytest.raises(ValidationError) as exc_info:
+            client._prepare_file(empty_file)
+        assert "File is empty" in str(exc_info.value)
+
+    def test_prepare_file_too_large(self, client: Parsefy, tmp_path: Path) -> None:
+        """Test that file exceeding size limit raises ValidationError."""
+        large_file = tmp_path / "large.pdf"
+        # Write 11MB of data
+        large_file.write_bytes(b"x" * (11 * 1024 * 1024))
+
+        with pytest.raises(ValidationError) as exc_info:
+            client._prepare_file(large_file)
+        assert "exceeds maximum allowed size" in str(exc_info.value)
+
+
+class TestParseResponse:
+    """Tests for response parsing logic."""
+
+    @pytest.fixture
+    def client(self) -> Parsefy:
+        """Create a test client."""
+        client = Parsefy(api_key="test_key")
+        yield client
+        client.close()
+
+    def test_parse_successful_response(self, client: Parsefy) -> None:
+        """Test parsing a successful API response."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "object": {"name": "Test", "value": 42},
+            "metadata": {
+                "processing_time_ms": 1500,
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "credits": 1,
+                "fallback_triggered": False,
+            },
+            "error": None,
+        }
+
+        result = client._parse_response(mock_response, SampleSchema)
+
+        assert isinstance(result, ExtractResult)
+        assert result.data is not None
+        assert result.data.name == "Test"
+        assert result.data.value == 42
+        assert result.metadata.processing_time_ms == 1500
+        assert result.metadata.credits == 1
+        assert result.error is None
+
+    def test_parse_extraction_error_response(self, client: Parsefy) -> None:
+        """Test parsing a response with extraction error."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "object": None,
+            "metadata": {
+                "processing_time_ms": 500,
+                "input_tokens": 100,
+                "output_tokens": 0,
+                "credits": 1,
+                "fallback_triggered": True,
+            },
+            "error": {
+                "code": "EXTRACTION_FAILED",
+                "message": "Could not extract data from document",
+            },
+        }
+
+        result = client._parse_response(mock_response, SampleSchema)
+
+        assert result.data is None
+        assert result.error is not None
+        assert result.error.code == "EXTRACTION_FAILED"
+        assert "Could not extract" in result.error.message
+        assert result.metadata.fallback_triggered is True
+
+    def test_parse_http_error_response(self, client: Parsefy) -> None:
+        """Test that HTTP errors raise APIError."""
+        mock_response = MagicMock()
+        mock_response.status_code = 401
+        mock_response.json.return_value = {"error": "Unauthorized"}
+
+        with pytest.raises(APIError) as exc_info:
+            client._parse_response(mock_response, SampleSchema)
+
+        assert exc_info.value.status_code == 401
+        assert "401" in exc_info.value.message
+
+
+class TestContextManager:
+    """Tests for context manager functionality."""
+
+    def test_sync_context_manager(self) -> None:
+        """Test synchronous context manager."""
+        with Parsefy(api_key="test_key") as client:
+            assert client.api_key == "test_key"
+
+    @pytest.mark.asyncio
+    async def test_async_context_manager(self) -> None:
+        """Test asynchronous context manager."""
+        async with Parsefy(api_key="test_key") as client:
+            assert client.api_key == "test_key"
+
+
