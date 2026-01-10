@@ -18,6 +18,14 @@ class SampleSchema(BaseModel):
     value: int = Field(description="A numeric value")
 
 
+class SampleSchemaWithOptional(BaseModel):
+    """Sample schema with optional field for testing."""
+
+    name: str = Field(description="A name field")
+    value: int = Field(description="A numeric value")
+    notes: str | None = Field(default=None, description="Optional notes")
+
+
 class TestParsefyInit:
     """Tests for Parsefy client initialization."""
 
@@ -48,6 +56,76 @@ class TestParsefyInit:
         client = Parsefy(api_key="test_key", timeout=120.0)
         assert client.timeout == 120.0
         client.close()
+
+
+class TestStripTitles:
+    """Tests for title stripping optimization."""
+
+    @pytest.fixture
+    def client(self) -> Parsefy:
+        """Create a test client."""
+        client = Parsefy(api_key="test_key")
+        yield client
+        client.close()
+
+    def test_strip_titles_removes_titles(self, client: Parsefy) -> None:
+        """Test that _strip_titles removes title fields."""
+        schema = {
+            "title": "MyModel",
+            "type": "object",
+            "properties": {
+                "name": {"title": "Name", "type": "string"},
+                "value": {"title": "Value", "type": "integer"},
+            },
+        }
+
+        client._strip_titles(schema)
+
+        assert "title" not in schema
+        assert "title" not in schema["properties"]["name"]
+        assert "title" not in schema["properties"]["value"]
+
+    def test_strip_titles_handles_nested_objects(self, client: Parsefy) -> None:
+        """Test that _strip_titles handles nested structures."""
+        schema = {
+            "title": "Parent",
+            "type": "object",
+            "properties": {
+                "child": {
+                    "title": "Child",
+                    "type": "object",
+                    "properties": {
+                        "name": {"title": "Name", "type": "string"}
+                    }
+                }
+            }
+        }
+
+        client._strip_titles(schema)
+
+        assert "title" not in schema
+        assert "title" not in schema["properties"]["child"]
+        assert "title" not in schema["properties"]["child"]["properties"]["name"]
+
+    def test_strip_titles_handles_arrays(self, client: Parsefy) -> None:
+        """Test that _strip_titles handles arrays."""
+        schema = {
+            "title": "Model",
+            "type": "object",
+            "properties": {
+                "items": {
+                    "title": "Items",
+                    "type": "array",
+                    "items": {"title": "Item", "type": "string"}
+                }
+            }
+        }
+
+        client._strip_titles(schema)
+
+        assert "title" not in schema
+        assert "title" not in schema["properties"]["items"]
+        assert "title" not in schema["properties"]["items"]["items"]
 
 
 class TestPrepareFile:
@@ -155,6 +233,26 @@ class TestParseResponse:
         mock_response.status_code = 200
         mock_response.json.return_value = {
             "object": {"name": "Test", "value": 42},
+            "_meta": {
+                "confidence_score": 0.95,
+                "field_confidence": [
+                    {
+                        "field": "$.name",
+                        "score": 0.98,
+                        "reason": "Exact match",
+                        "page": 1,
+                        "text": "Test"
+                    },
+                    {
+                        "field": "$.value",
+                        "score": 0.92,
+                        "reason": "Numeric extraction",
+                        "page": 1,
+                        "text": "42"
+                    },
+                ],
+                "issues": [],
+            },
             "metadata": {
                 "processing_time_ms": 1500,
                 "input_tokens": 100,
@@ -171,8 +269,35 @@ class TestParseResponse:
         assert result.data is not None
         assert result.data.name == "Test"
         assert result.data.value == 42
+        assert result.meta is not None
+        assert result.meta.confidence_score == 0.95
+        assert len(result.meta.field_confidence) == 2
+        assert result.meta.field_confidence[0].field == "$.name"
+        assert result.meta.field_confidence[0].score == 0.98
         assert result.metadata.processing_time_ms == 1500
         assert result.metadata.credits == 1
+        assert result.error is None
+
+    def test_parse_response_without_meta(self, client: Parsefy) -> None:
+        """Test parsing a response without _meta field (backward compatibility)."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "object": {"name": "Test", "value": 42},
+            "metadata": {
+                "processing_time_ms": 1500,
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "credits": 1,
+                "fallback_triggered": False,
+            },
+            "error": None,
+        }
+
+        result = client._parse_response(mock_response, SampleSchema)
+
+        assert result.data is not None
+        assert result.meta is None  # No _meta in response
         assert result.error is None
 
     def test_parse_extraction_error_response(self, client: Parsefy) -> None:
@@ -181,6 +306,11 @@ class TestParseResponse:
         mock_response.status_code = 200
         mock_response.json.return_value = {
             "object": None,
+            "_meta": {
+                "confidence_score": 0.3,
+                "field_confidence": [],
+                "issues": ["Could not identify invoice number"],
+            },
             "metadata": {
                 "processing_time_ms": 500,
                 "input_tokens": 100,
@@ -201,6 +331,8 @@ class TestParseResponse:
         assert result.error.code == "EXTRACTION_FAILED"
         assert "Could not extract" in result.error.message
         assert result.metadata.fallback_triggered is True
+        assert result.meta is not None
+        assert len(result.meta.issues) == 1
 
     def test_parse_http_error_response(self, client: Parsefy) -> None:
         """Test that HTTP errors raise APIError."""
@@ -213,6 +345,27 @@ class TestParseResponse:
 
         assert exc_info.value.status_code == 401
         assert "401" in exc_info.value.message
+
+
+class TestSchemaGeneration:
+    """Tests for schema generation and required fields."""
+
+    def test_required_fields_in_schema(self) -> None:
+        """Test that all non-optional fields are marked as required."""
+        schema = SampleSchema.model_json_schema()
+
+        assert "required" in schema
+        assert "name" in schema["required"]
+        assert "value" in schema["required"]
+
+    def test_optional_fields_not_required(self) -> None:
+        """Test that optional fields are not in required array."""
+        schema = SampleSchemaWithOptional.model_json_schema()
+
+        assert "required" in schema
+        assert "name" in schema["required"]
+        assert "value" in schema["required"]
+        assert "notes" not in schema["required"]
 
 
 class TestContextManager:
@@ -228,5 +381,3 @@ class TestContextManager:
         """Test asynchronous context manager."""
         async with Parsefy(api_key="test_key") as client:
             assert client.api_key == "test_key"
-
-

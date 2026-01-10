@@ -1,17 +1,23 @@
-"""Parsefy API client for document data extraction."""
+"""Parsefy API client for financial document data extraction."""
 
 from __future__ import annotations
 
 import json
 import os
 from pathlib import Path
-from typing import BinaryIO, TypeVar
+from typing import Any, BinaryIO, TypeVar
 
 import httpx
 from pydantic import BaseModel
 
 from parsefy.errors import APIError, ValidationError
-from parsefy.types import APIErrorDetail, ExtractResult, ExtractionMetadata
+from parsefy.types import (
+    APIErrorDetail,
+    ExtractResult,
+    ExtractionMeta,
+    ExtractionMetadata,
+    FieldConfidence,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -23,16 +29,43 @@ MIME_TYPES = {
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
 BASE_URL = "https://api.parsefy.io"
+DEFAULT_CONFIDENCE_THRESHOLD = 0.85
 
 
 class Parsefy:
     """
-    Parsefy API client for document data extraction.
+    Parsefy API client for financial document data extraction.
+
+    Parsefy turns financial PDFs (invoices, receipts, bills) into structured
+    JSON with validation and confidence scores. We return validated output
+    or fail loudly - no silent errors.
 
     Args:
         api_key: Your Parsefy API key. If not provided, reads from
                  PARSEFY_API_KEY environment variable.
         timeout: Request timeout in seconds (default: 60)
+
+    Important - Required vs Optional Fields:
+        By default, ALL fields in your Pydantic model are required. If a required
+        field cannot be extracted with sufficient confidence, the fallback model
+        is triggered (which costs more credits).
+
+        To mark a field as optional, use: `field_name: str | None = None`
+
+        Example:
+            ```python
+            class Invoice(BaseModel):
+                # REQUIRED - will trigger fallback if not found confidently
+                invoice_number: str = Field(description="The invoice number")
+                total: float = Field(description="Total amount")
+
+                # OPTIONAL - won't trigger fallback if missing
+                po_number: str | None = Field(default=None, description="PO number if present")
+                notes: str | None = Field(default=None, description="Additional notes")
+            ```
+
+        Tip: Only mark fields as required if they MUST be present. Making rarely-
+        present fields required will trigger expensive fallback models frequently.
 
     Example:
         ```python
@@ -49,6 +82,7 @@ class Parsefy:
 
         if result.error is None:
             print(result.data.invoice_number)
+            print(f"Confidence: {result.meta.confidence_score}")
         ```
     """
 
@@ -80,6 +114,22 @@ class Parsefy:
                 headers={"Authorization": f"Bearer {self.api_key}"},
             )
         return self._async_client
+
+    def _strip_titles(self, schema: Any) -> None:
+        """
+        Recursively remove 'title' keys from schema to save tokens.
+
+        Pydantic adds a 'title' field to every property by default, which
+        wastes tokens and adds noise for the LLM.
+        """
+        if isinstance(schema, dict):
+            if "title" in schema:
+                del schema["title"]
+            for value in schema.values():
+                self._strip_titles(value)
+        elif isinstance(schema, list):
+            for item in schema:
+                self._strip_titles(item)
 
     def _prepare_file(
         self,
@@ -157,6 +207,26 @@ class Parsefy:
             fallback_triggered=data["metadata"]["fallback_triggered"],
         )
 
+        # Parse the new _meta structure
+        meta = None
+        if data.get("_meta"):
+            meta_data = data["_meta"]
+            field_confidence = [
+                FieldConfidence(
+                    field=fc["field"],
+                    score=fc["score"],
+                    reason=fc["reason"],
+                    page=fc["page"],
+                    text=fc["text"],
+                )
+                for fc in meta_data.get("field_confidence", [])
+            ]
+            meta = ExtractionMeta(
+                confidence_score=meta_data["confidence_score"],
+                field_confidence=field_confidence,
+                issues=meta_data.get("issues", []),
+            )
+
         error = None
         if data.get("error"):
             error = APIErrorDetail(
@@ -170,6 +240,7 @@ class Parsefy:
 
         return ExtractResult[T](
             data=extracted_data,
+            meta=meta,
             metadata=metadata,
             error=error,
         )
@@ -179,9 +250,10 @@ class Parsefy:
         *,
         file: str | Path | bytes | BinaryIO,
         schema: type[T],
+        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     ) -> ExtractResult[T]:
         """
-        Extract structured data from a document (synchronous).
+        Extract structured data from a financial document (synchronous).
 
         Args:
             file: Document to extract from. Can be:
@@ -190,10 +262,14 @@ class Parsefy:
                   - BinaryIO: File-like object
             schema: Pydantic model class defining the extraction schema.
                     Use Field(description="...") to guide the AI.
+            confidence_threshold: Minimum confidence score (0-1) for extraction.
+                    Default: 0.85. Lower = faster (accepts Tier 1 more often).
+                    Higher = more accurate (triggers Tier 2 fallback more often).
 
         Returns:
             ExtractResult containing:
             - data: Extracted data as the schema type (or None on error)
+            - meta: Field-level confidence scores and evidence
             - metadata: Processing metadata (tokens, time, credits)
             - error: Error details if extraction failed (or None on success)
 
@@ -201,30 +277,49 @@ class Parsefy:
             ValidationError: If file is invalid (not found, wrong type, too large)
             APIError: If the API returns an HTTP error (4xx/5xx)
 
+        Important - Required Fields & Billing:
+            ALL fields are required by default. If a required field's confidence
+            is below the threshold, the fallback model is triggered (more credits).
+
+            To avoid unexpected costs, mark rarely-present fields as optional:
+            `field_name: str | None = None`
+
         Example:
             ```python
             class Invoice(BaseModel):
-                number: str = Field(description="Invoice number")
+                # Required fields - MUST be present
+                invoice_number: str = Field(description="Invoice number")
                 total: float = Field(description="Total amount")
+
+                # Optional field - won't trigger fallback if missing
+                po_number: str | None = Field(default=None, description="PO number")
 
             result = client.extract(file="invoice.pdf", schema=Invoice)
 
             if result.error is None:
-                print(result.data.number)
-                print(f"Credits used: {result.metadata.credits}")
+                print(result.data.invoice_number)
+                print(f"Confidence: {result.meta.confidence_score}")
+
+                # Check individual field confidence
+                for field in result.meta.field_confidence:
+                    print(f"{field.field}: {field.score} - {field.reason}")
             else:
                 print(f"Error: {result.error.message}")
             ```
         """
         filename, file_bytes, content_type = self._prepare_file(file)
 
-        # Convert Pydantic model to JSON Schema
+        # Convert Pydantic model to JSON Schema and optimize for tokens
         json_schema = schema.model_json_schema()
+        self._strip_titles(json_schema)
 
         response = self._client.post(
             f"{BASE_URL}/v1/extract",
             files={"file": (filename, file_bytes, content_type)},
-            data={"output_schema": json.dumps(json_schema)},
+            data={
+                "output_schema": json.dumps(json_schema),
+                "confidence_threshold": str(confidence_threshold),
+            },
         )
 
         return self._parse_response(response, schema)
@@ -234,26 +329,40 @@ class Parsefy:
         *,
         file: str | Path | bytes | BinaryIO,
         schema: type[T],
+        confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
     ) -> ExtractResult[T]:
         """
-        Extract structured data from a document (asynchronous).
+        Extract structured data from a financial document (asynchronous).
 
         Same as extract() but async. See extract() for full documentation.
 
+        Args:
+            file: Document to extract from
+            schema: Pydantic model class defining the extraction schema
+            confidence_threshold: Minimum confidence score (0-1). Default: 0.85
+
         Example:
             ```python
-            result = await client.extract_async(file="invoice.pdf", schema=Invoice)
+            result = await client.extract_async(
+                file="invoice.pdf",
+                schema=Invoice,
+                confidence_threshold=0.9  # Higher accuracy
+            )
             ```
         """
         filename, file_bytes, content_type = self._prepare_file(file)
 
         json_schema = schema.model_json_schema()
+        self._strip_titles(json_schema)
 
         client = self._get_async_client()
         response = await client.post(
             f"{BASE_URL}/v1/extract",
             files={"file": (filename, file_bytes, content_type)},
-            data={"output_schema": json.dumps(json_schema)},
+            data={
+                "output_schema": json.dumps(json_schema),
+                "confidence_threshold": str(confidence_threshold),
+            },
         )
 
         return self._parse_response(response, schema)
@@ -282,5 +391,3 @@ class Parsefy:
 
     async def __aexit__(self, *args: object) -> None:
         await self.aclose()
-
-
