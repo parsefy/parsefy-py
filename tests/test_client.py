@@ -255,8 +255,6 @@ class TestParseResponse:
             },
             "metadata": {
                 "processing_time_ms": 1500,
-                "input_tokens": 100,
-                "output_tokens": 50,
                 "credits": 1,
                 "fallback_triggered": False,
             },
@@ -286,8 +284,6 @@ class TestParseResponse:
             "object": {"name": "Test", "value": 42},
             "metadata": {
                 "processing_time_ms": 1500,
-                "input_tokens": 100,
-                "output_tokens": 50,
                 "credits": 1,
                 "fallback_triggered": False,
             },
@@ -313,8 +309,6 @@ class TestParseResponse:
             },
             "metadata": {
                 "processing_time_ms": 500,
-                "input_tokens": 100,
-                "output_tokens": 0,
                 "credits": 1,
                 "fallback_triggered": True,
             },
@@ -381,3 +375,84 @@ class TestContextManager:
         """Test asynchronous context manager."""
         async with Parsefy(api_key="test_key") as client:
             assert client.api_key == "test_key"
+
+
+class TestVerification:
+    """Tests for math verification functionality."""
+
+    @pytest.fixture
+    def client(self) -> Parsefy:
+        """Create a test client."""
+        client = Parsefy(api_key="test_key")
+        yield client
+        client.close()
+
+    def test_parse_response_with_verification(self, client: Parsefy) -> None:
+        """Test parsing a response with verification results."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "object": {"name": "Test", "value": 42},
+            "_meta": {
+                "confidence_score": 0.95,
+                "field_confidence": [],
+                "issues": [],
+            },
+            "metadata": {
+                "processing_time_ms": 1500,
+                "credits": 1,
+                "fallback_triggered": False,
+            },
+            "verification": {
+                "status": "PASSED",
+                "checks_passed": 1,
+                "checks_failed": 0,
+                "cannot_verify_count": 0,
+                "checks_run": [
+                    {
+                        "type": "HORIZONTAL_SUM",
+                        "status": "PASSED",
+                        "fields": ["total", "subtotal", "tax"],
+                        "passed": True,
+                        "delta": 0.0,
+                        "expected": 1250.00,
+                        "actual": 1250.00,
+                    }
+                ],
+            },
+            "error": None,
+        }
+
+        result = client._parse_response(mock_response, SampleSchema)
+
+        assert result.verification is not None
+        assert result.verification.status == "PASSED"
+        assert result.verification.checks_passed == 1
+        assert result.verification.checks_failed == 0
+        assert len(result.verification.checks_run) == 1
+        assert result.verification.checks_run[0].type == "HORIZONTAL_SUM"
+        assert result.verification.checks_run[0].passed is True
+        assert result.verification.checks_run[0].delta == 0.0
+
+    def test_parse_response_without_verification(self, client: Parsefy) -> None:
+        """Test parsing a response without verification (default behavior)."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "object": {"name": "Test", "value": 42},
+            "_meta": {
+                "confidence_score": 0.95,
+                "field_confidence": [],
+                "issues": [],
+            },
+            "metadata": {
+                "processing_time_ms": 1500,
+                "credits": 1,
+                "fallback_triggered": False,
+            },
+            "error": None,
+        }
+
+        result = client._parse_response(mock_response, SampleSchema)
+
+        assert result.verification is None

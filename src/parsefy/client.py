@@ -17,6 +17,8 @@ from parsefy.types import (
     ExtractionMeta,
     ExtractionMetadata,
     FieldConfidence,
+    Verification,
+    VerificationCheck,
 )
 
 T = TypeVar("T", bound=BaseModel)
@@ -201,8 +203,6 @@ class Parsefy:
 
         metadata = ExtractionMetadata(
             processing_time_ms=data["metadata"]["processing_time_ms"],
-            input_tokens=data["metadata"]["input_tokens"],
-            output_tokens=data["metadata"]["output_tokens"],
             credits=data["metadata"]["credits"],
             fallback_triggered=data["metadata"]["fallback_triggered"],
         )
@@ -227,6 +227,30 @@ class Parsefy:
                 issues=meta_data.get("issues", []),
             )
 
+        # Parse verification results if present
+        verification = None
+        if data.get("verification"):
+            verification_data = data["verification"]
+            checks_run = [
+                VerificationCheck(
+                    type=check["type"],
+                    status=check["status"],
+                    fields=check["fields"],
+                    passed=check["passed"],
+                    delta=check["delta"],
+                    expected=check["expected"],
+                    actual=check["actual"],
+                )
+                for check in verification_data.get("checks_run", [])
+            ]
+            verification = Verification(
+                status=verification_data["status"],
+                checks_passed=verification_data["checks_passed"],
+                checks_failed=verification_data["checks_failed"],
+                cannot_verify_count=verification_data["cannot_verify_count"],
+                checks_run=checks_run,
+            )
+
         error = None
         if data.get("error"):
             error = APIErrorDetail(
@@ -242,6 +266,7 @@ class Parsefy:
             data=extracted_data,
             meta=meta,
             metadata=metadata,
+            verification=verification,
             error=error,
         )
 
@@ -251,6 +276,7 @@ class Parsefy:
         file: str | Path | bytes | BinaryIO,
         schema: type[T],
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+        enable_verification: bool = False,
     ) -> ExtractResult[T]:
         """
         Extract structured data from a financial document (synchronous).
@@ -265,6 +291,10 @@ class Parsefy:
             confidence_threshold: Minimum confidence score (0-1) for extraction.
                     Default: 0.85. Lower = faster (accepts Tier 1 more often).
                     Higher = more accurate (triggers Tier 2 fallback more often).
+            enable_verification: Enable math verification (includes shadow extraction).
+                    Default: False. When True, verifies mathematical consistency
+                    (totals, subtotals, taxes, line items) and includes verification
+                    results in the response.
 
         Returns:
             ExtractResult containing:
@@ -313,13 +343,17 @@ class Parsefy:
         json_schema = schema.model_json_schema()
         self._strip_titles(json_schema)
 
+        data_payload = {
+            "output_schema": json.dumps(json_schema),
+            "confidence_threshold": str(confidence_threshold),
+        }
+        if enable_verification:
+            data_payload["enable_verification"] = "true"
+
         response = self._client.post(
             f"{BASE_URL}/v1/extract",
             files={"file": (filename, file_bytes, content_type)},
-            data={
-                "output_schema": json.dumps(json_schema),
-                "confidence_threshold": str(confidence_threshold),
-            },
+            data=data_payload,
         )
 
         return self._parse_response(response, schema)
@@ -330,6 +364,7 @@ class Parsefy:
         file: str | Path | bytes | BinaryIO,
         schema: type[T],
         confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
+        enable_verification: bool = False,
     ) -> ExtractResult[T]:
         """
         Extract structured data from a financial document (asynchronous).
@@ -340,6 +375,9 @@ class Parsefy:
             file: Document to extract from
             schema: Pydantic model class defining the extraction schema
             confidence_threshold: Minimum confidence score (0-1). Default: 0.85
+            enable_verification: Enable math verification (includes shadow extraction).
+                    Default: False. When True, verifies mathematical consistency
+                    and includes verification results in the response.
 
         Example:
             ```python
@@ -355,14 +393,18 @@ class Parsefy:
         json_schema = schema.model_json_schema()
         self._strip_titles(json_schema)
 
+        data_payload = {
+            "output_schema": json.dumps(json_schema),
+            "confidence_threshold": str(confidence_threshold),
+        }
+        if enable_verification:
+            data_payload["enable_verification"] = "true"
+
         client = self._get_async_client()
         response = await client.post(
             f"{BASE_URL}/v1/extract",
             files={"file": (filename, file_bytes, content_type)},
-            data={
-                "output_schema": json.dumps(json_schema),
-                "confidence_threshold": str(confidence_threshold),
-            },
+            data=data_payload,
         )
 
         return self._parse_response(response, schema)

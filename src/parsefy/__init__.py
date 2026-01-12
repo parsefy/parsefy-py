@@ -24,7 +24,8 @@ Example:
 
     if result.error is None:
         print(result.data.invoice_number)
-        print(f"Confidence: {result.meta.confidence_score}")
+        if result.meta:
+            print(f"Confidence: {result.meta.confidence_score}")
     ```
 
 Important:
@@ -42,9 +43,11 @@ from parsefy.types import (
     ExtractionMeta,
     ExtractionMetadata,
     FieldConfidence,
+    Verification,
+    VerificationCheck,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.1.2"
 
 __all__ = [
     "Parsefy",
@@ -57,4 +60,6 @@ __all__ = [
     "ExtractionMetadata",
     "FieldConfidence",
     "APIErrorDetail",
+    "Verification",
+    "VerificationCheck",
 ]
